@@ -139,16 +139,31 @@ fn_load_config() {
 
 fn_check_deps() {
 	local missing=()
-	for cmd in wine64 xvfb-run tmux steamcmd; do
+	# steamcmd is NOT checked here — fn_steamcmd_install_binary bootstraps it automatically.
+	# wine: modern Wine installs use a single 64-bit 'wine' binary; no separate 'wine64'.
+	for cmd in tmux xvfb-run; do
 		if ! command -v "${cmd}" &>/dev/null; then
 			missing+=("${cmd}")
 		fi
 	done
+	# Accept either wine64 or wine (Wine 6+ unified binary)
+	if ! command -v wine64 &>/dev/null && ! command -v wine &>/dev/null; then
+		missing+=("wine (or wine64)")
+	fi
 	if [ ${#missing[@]} -gt 0 ]; then
 		fn_print_fail "Missing required dependencies: ${missing[*]}"
 		fn_print_info "Run 'windrose-setup.sh' as root to install dependencies."
 		fn_script_log_fail "Missing dependencies: ${missing[*]}"
 		exit 1
+	fi
+}
+
+# Resolve the correct wine binary name (wine64 or wine)
+fn_wine_cmd() {
+	if command -v wine64 &>/dev/null; then
+		echo "wine64"
+	else
+		echo "wine"
 	fi
 }
 
@@ -199,8 +214,10 @@ fn_start() {
 
 	mkdir -p "${logdir}/server"
 
+	local wine_bin
+	wine_bin="$(fn_wine_cmd)"
 	local gamelog="${logdir}/server/${selfname}-server.log"
-	local launch_cmd="WINEDEBUG=-all WINEPREFIX=\"${wineprefix}\" xvfb-run -a wine64 \"${serverfiles}/${serverexe}\" -PORT=${port} -QUERYPORT=${queryport} ${startparameters}"
+	local launch_cmd="WINEDEBUG=-all WINEPREFIX=\"${wineprefix}\" xvfb-run -a ${wine_bin} \"${serverfiles}/${serverexe}\" -PORT=${port} -QUERYPORT=${queryport} ${startparameters}"
 
 	fn_print_dots "Starting ${selfname}"
 	fn_script_log_info "Starting server: ${launch_cmd}"
@@ -307,8 +324,10 @@ fn_debug() {
 	echo -e "${lightyellow}Starting in DEBUG mode (foreground, no tmux)...${default}"
 	echo -e "${lightyellow}Press Ctrl+C to stop.${default}"
 
+	local wine_bin
+	wine_bin="$(fn_wine_cmd)"
 	WINEDEBUG=warn WINEPREFIX="${wineprefix}" \
-		xvfb-run -a wine64 \
+		xvfb-run -a "${wine_bin}" \
 		"${serverfiles}/${serverexe}" \
 		-PORT="${port}" -QUERYPORT="${queryport}" ${startparameters}
 }
@@ -611,6 +630,7 @@ fn_winesetup() {
 	export WINEPREFIX="${wineprefix}"
 
 	# Boot Wine prefix (creates directory structure, sets up registry)
+	# wineboot is always its own binary (separate from wine/wine64)
 	WINEDEBUG=-all WINEPREFIX="${wineprefix}" wineboot --init 2>/dev/null
 	sleep 2
 
