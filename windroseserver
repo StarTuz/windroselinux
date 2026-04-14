@@ -1,0 +1,769 @@
+#!/bin/bash
+# ============================================================
+# windroseserver — Windrose Dedicated Server Manager
+# Mirrors LinuxGSM interface and conventions.
+# Runs WindroseServer.exe under Wine + Xvfb on Linux.
+#
+# Official guide: https://playwindrose.com/dedicated-server-guide/
+# Steam AppID:    4129620 (FREE dedicated server app - anonymous login)
+#
+# Acquisition: SteamCMD downloads the free Windrose Dedicated Server app.
+# Server EXE:  WindroseServer.exe (Unreal Engine 5, Windows-only)
+# Linux path:  Runs via Wine (wine64) + Xvfb (virtual display)
+#
+# Save data (Wine): WINEPREFIX/drive_c/users/windrose/AppData/Local/R5/
+#
+# Usage: ./windroseserver <command>
+# Run as: windrose user (or root for setup only)
+# ============================================================
+
+# --- Script Identity (mirrors LinuxGSM smserver structure) ---
+version="1.0.0"
+shortname="wr"
+gameservername="windroseserver"
+commandname="CORE"
+
+rootdir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+selfname="$(basename "$(readlink -f "${BASH_SOURCE[0]}")")"
+lgsmdir="${rootdir}/lgsm"
+logdir="${rootdir}/log"
+lgsmlogdir="${logdir}/script"
+lgsmlog="${lgsmlogdir}/${selfname}-script.log"
+serverfiles="${rootdir}/serverfiles"
+configdir="${lgsmdir}/config-lgsm"
+configdirserver="${configdir}/${gameservername}"
+steamcmddir="${HOME}/.steam/steamcmd"
+backupdir="${rootdir}/backup"
+tmpdir="${lgsmdir}/tmp"
+wineprefix="${rootdir}/.wine"
+
+# Server executable (inside serverfiles)
+# Per official guide: the server app is the WindroseServer folder at root
+serverexe="WindroseServer.exe"
+sessionname="${selfname}"
+
+# Wine save data path (AppData is under WINEPREFIX, not serverfiles)
+# On Windows: C:\Users\{User}\AppData\Local\R5\Saved\SaveProfiles\
+# Under Wine:  ${wineprefix}/drive_c/users/${USER}/AppData/Local/R5/Saved/SaveProfiles/
+wine_appdata_save="${wineprefix}/drive_c/users/${WINDROSE_USER:-windrose}/AppData/Local/R5/Saved/SaveProfiles"
+
+# --- Color Codes (same as LinuxGSM) ---
+red="\e[0;31m"
+lightred="\e[1;31m"
+green="\e[0;32m"
+lightgreen="\e[1;32m"
+yellow="\e[0;33m"
+lightyellow="\e[1;33m"
+blue="\e[0;34m"
+lightblue="\e[1;34m"
+cyan="\e[0;36m"
+lightcyan="\e[1;36m"
+white="\e[1;37m"
+default="\e[0m"
+
+# --- Config Defaults (overridden by config files) ---
+servername="Windrose Server"
+port="7777"
+queryport="7778"
+maxplayers="10"
+steamuser=""
+steampass=""
+# AppID 4129620 = Windrose Dedicated Server (free app, anonymous login works)
+steamappid="4129620"
+serverpassword=""
+# P2pProxyAddress: set to your server's public IP for proper NAT/invite connectivity
+# Leave as 127.0.0.1 for LAN-only. The server writes this into ServerDescription.json.
+p2pproxyaddress="127.0.0.1"
+# Extra launch parameters (appended to command line)
+startparameters="-log -MULTIHOME=0.0.0.0"
+
+# ============================================================
+# Core Functions
+# ============================================================
+
+fn_print_ok() {
+	echo -e "[ ${green}OK${default} ] $*"
+}
+
+fn_print_info() {
+	echo -e "[ ${cyan}INFO${default} ] $*"
+}
+
+fn_print_warn() {
+	echo -e "[ ${yellow}WARN${default} ] $*"
+}
+
+fn_print_fail() {
+	echo -e "[ ${lightred}FAIL${default} ] $*"
+}
+
+fn_print_dots() {
+	echo -en "[ .... ] $* "
+}
+
+fn_log() {
+	local level="$1"
+	shift
+	local msg="$*"
+	local ts
+	ts="$(date '+%Y-%m-%d %H:%M:%S')"
+	mkdir -p "${lgsmlogdir}"
+	echo "${ts} [${level}] ${msg}" >> "${lgsmlog}"
+}
+
+fn_script_log_info() { fn_log "INFO" "$*"; }
+fn_script_log_warn() { fn_log "WARN" "$*"; }
+fn_script_log_fail() { fn_log "FAIL" "$*"; }
+fn_script_log_pass() { fn_log "PASS" "$*"; }
+
+# --- Load Configuration (LinuxGSM layered config: _default -> common -> instance -> secrets) ---
+fn_load_config() {
+	# _default.cfg is baked in (defaults above); load overrides in order
+	if [ -f "${configdirserver}/common.cfg" ]; then
+		# shellcheck source=/dev/null
+		source "${configdirserver}/common.cfg"
+	fi
+	if [ -f "${configdirserver}/${selfname}.cfg" ]; then
+		# shellcheck source=/dev/null
+		source "${configdirserver}/${selfname}.cfg"
+	fi
+	if [ -f "${configdirserver}/secrets-common.cfg" ]; then
+		# shellcheck source=/dev/null
+		source "${configdirserver}/secrets-common.cfg"
+	fi
+	if [ -f "${configdirserver}/secrets-${selfname}.cfg" ]; then
+		# shellcheck source=/dev/null
+		source "${configdirserver}/secrets-${selfname}.cfg"
+	fi
+}
+
+fn_check_deps() {
+	local missing=()
+	for cmd in wine64 xvfb-run tmux steamcmd; do
+		if ! command -v "${cmd}" &>/dev/null; then
+			missing+=("${cmd}")
+		fi
+	done
+	if [ ${#missing[@]} -gt 0 ]; then
+		fn_print_fail "Missing required dependencies: ${missing[*]}"
+		fn_print_info "Run 'windrose-setup.sh' as root to install dependencies."
+		fn_script_log_fail "Missing dependencies: ${missing[*]}"
+		exit 1
+	fi
+}
+
+fn_check_user() {
+	if [ "$(whoami)" == "root" ]; then
+		fn_print_warn "Do not run ${selfname} as root. Use the 'windrose' user."
+		fn_print_info "Example: sudo -u windrose ./${selfname} start"
+		exit 1
+	fi
+}
+
+# ============================================================
+# Session / Process Management
+# ============================================================
+
+fn_is_running() {
+	# Returns 0 if server tmux session is alive, 1 if not
+	tmux has-session -t "${sessionname}" 2>/dev/null
+}
+
+fn_get_pid() {
+	# Get the PID of WindroseServer.exe inside the tmux session
+	pgrep -u "$(whoami)" -f "WindroseServer.exe" | head -1
+}
+
+# ============================================================
+# Commands
+# ============================================================
+
+# --- start ---
+fn_start() {
+	fn_check_user
+	fn_check_deps
+	fn_load_config
+
+	if fn_is_running; then
+		fn_print_warn "${selfname}: Server is already running (tmux session '${sessionname}' exists)."
+		fn_script_log_warn "Start requested but server already running."
+		exit 0
+	fi
+
+	if [ ! -f "${serverfiles}/${serverexe}" ]; then
+		fn_print_fail "Server executable not found: ${serverfiles}/${serverexe}"
+		fn_print_info "Run './${selfname} install' first."
+		fn_script_log_fail "Server executable missing."
+		exit 1
+	fi
+
+	mkdir -p "${logdir}/server"
+
+	local gamelog="${logdir}/server/${selfname}-server.log"
+	local launch_cmd="WINEDEBUG=-all WINEPREFIX=\"${wineprefix}\" xvfb-run -a wine64 \"${serverfiles}/${serverexe}\" -PORT=${port} -QUERYPORT=${queryport} ${startparameters}"
+
+	fn_print_dots "Starting ${selfname}"
+	fn_script_log_info "Starting server: ${launch_cmd}"
+
+	tmux new-session -d -s "${sessionname}" \
+		"bash -c '${launch_cmd} 2>&1 | tee -a \"${gamelog}\"'"
+
+	sleep 2
+	if fn_is_running; then
+		fn_print_ok "Starting ${selfname}"
+		fn_script_log_pass "Server started in tmux session '${sessionname}'."
+	else
+		fn_print_fail "Starting ${selfname} — tmux session died immediately. Check logs: ${gamelog}"
+		fn_script_log_fail "Server failed to start."
+		exit 1
+	fi
+}
+
+# --- stop ---
+fn_stop() {
+	fn_check_user
+	fn_load_config
+
+	if ! fn_is_running; then
+		fn_print_warn "${selfname}: Server is not running."
+		fn_script_log_warn "Stop requested but server not running."
+		exit 0
+	fi
+
+	fn_print_dots "Stopping ${selfname}"
+	fn_script_log_info "Stopping server."
+
+	# Send SIGTERM to the Wine process first for graceful shutdown
+	local pid
+	pid="$(fn_get_pid)"
+	if [ -n "${pid}" ]; then
+		kill -TERM "${pid}" 2>/dev/null
+		sleep 5
+	fi
+
+	# Kill the tmux session
+	tmux kill-session -t "${sessionname}" 2>/dev/null
+
+	if ! fn_is_running; then
+		fn_print_ok "Stopping ${selfname}"
+		fn_script_log_pass "Server stopped."
+	else
+		fn_print_fail "Stopping ${selfname} — session still alive. Forcing."
+		tmux kill-session -t "${sessionname}" 2>/dev/null
+		fn_script_log_warn "Server required force kill."
+	fi
+}
+
+# --- restart ---
+fn_restart() {
+	fn_print_info "Restarting ${selfname}..."
+	fn_stop
+	sleep 2
+	fn_start
+}
+
+# --- monitor ---
+fn_monitor() {
+	fn_load_config
+	fn_script_log_info "Monitor check running."
+
+	if fn_is_running; then
+		fn_print_ok "Monitor: ${selfname} is running."
+		fn_script_log_pass "Monitor: server is running."
+	else
+		fn_print_warn "Monitor: ${selfname} is NOT running. Attempting restart..."
+		fn_script_log_warn "Monitor: server not running, auto-restarting."
+		fn_start
+	fi
+}
+
+# --- console ---
+fn_console() {
+	fn_check_user
+	if ! fn_is_running; then
+		fn_print_fail "Server is not running. No console available."
+		exit 1
+	fi
+	echo -e "${lightcyan}Attaching to console — press Ctrl+B then D to detach.${default}"
+	tmux attach-session -t "${sessionname}"
+}
+
+# --- debug ---
+fn_debug() {
+	fn_check_user
+	fn_check_deps
+	fn_load_config
+
+	if fn_is_running; then
+		fn_print_fail "Server is already running. Stop it first."
+		exit 1
+	fi
+
+	if [ ! -f "${serverfiles}/${serverexe}" ]; then
+		fn_print_fail "Server executable not found: ${serverfiles}/${serverexe}"
+		exit 1
+	fi
+
+	echo -e "${lightyellow}Starting in DEBUG mode (foreground, no tmux)...${default}"
+	echo -e "${lightyellow}Press Ctrl+C to stop.${default}"
+
+	WINEDEBUG=warn WINEPREFIX="${wineprefix}" \
+		xvfb-run -a wine64 \
+		"${serverfiles}/${serverexe}" \
+		-PORT="${port}" -QUERYPORT="${queryport}" ${startparameters}
+}
+
+# --- details ---
+fn_details() {
+	fn_load_config
+	local status
+	if fn_is_running; then
+		status="${green}RUNNING${default}"
+	else
+		status="${red}STOPPED${default}"
+	fi
+
+	local pid
+	pid="$(fn_get_pid)"
+	[ -z "${pid}" ] && pid="N/A"
+
+	# Resolve Wine AppData save path for current user
+	local wine_user_save
+	wine_user_save="${wineprefix}/drive_c/users/$(whoami)/AppData/Local/R5/Saved/SaveProfiles"
+
+	echo ""
+	echo -e "${lightcyan}========================================${default}"
+	echo -e " ${white}Windrose Server Details${default}"
+	echo -e "${lightcyan}========================================${default}"
+	echo -e " ${lightblue}Status:${default}        $(echo -e "${status}")"
+	echo -e " ${lightblue}PID:${default}           ${pid}"
+	echo -e " ${lightblue}Session:${default}       ${sessionname}"
+	echo -e " ${lightblue}Server Name:${default}   ${servername}"
+	echo -e " ${lightblue}Game Port:${default}     ${port}/UDP"
+	echo -e " ${lightblue}Query Port:${default}    ${queryport}/UDP"
+	echo -e " ${lightblue}Max Players:${default}   ${maxplayers}"
+	echo -e " ${lightblue}P2P Proxy:${default}     ${p2pproxyaddress}"
+	echo -e " ${lightblue}Server Files:${default}  ${serverfiles}"
+	echo -e " ${lightblue}Log Dir:${default}       ${logdir}"
+	echo -e " ${lightblue}Config Dir:${default}    ${configdirserver}"
+	echo -e " ${lightblue}Save Data:${default}     ${wine_user_save}"
+	echo -e " ${lightblue}WINEPREFIX:${default}    ${wineprefix}"
+	echo -e "${lightcyan}========================================${default}"
+	echo ""
+
+	# Show invite code and server description from ServerDescription.json
+	# The file may be in the root serverfiles dir (after first run)
+	local sdesc="${serverfiles}/ServerDescription.json"
+	if [ -f "${sdesc}" ]; then
+		echo -e " ${lightblue}ServerDescription.json:${default}"
+		echo ""
+		# Extract and display invite code prominently
+		local invite_code
+		invite_code=$(grep -o '"InviteCode"[[:space:]]*:[[:space:]]*"[^"]*"' "${sdesc}" \
+			| grep -o '"[^"]*"$' | tr -d '"')
+		if [ -n "${invite_code}" ]; then
+			echo -e " ${lightgreen}★ Invite Code: ${white}${invite_code}${default}"
+			echo -e "   Share this code: Play → Connect to Server → paste the code"
+			echo ""
+		fi
+		cat "${sdesc}" | python3 -m json.tool 2>/dev/null || cat "${sdesc}"
+		echo ""
+	else
+		echo -e " ${yellow}ServerDescription.json not found — start the server once to generate it.${default}"
+		echo ""
+	fi
+}
+
+# --- logs ---
+fn_logs() {
+	local gamelog="${logdir}/server/${selfname}-server.log"
+	if [ -f "${gamelog}" ]; then
+		tail -50 "${gamelog}"
+	else
+		fn_print_warn "No server log found yet: ${gamelog}"
+	fi
+}
+
+# --- install ---
+fn_install() {
+	fn_check_user
+	fn_check_deps
+
+	echo ""
+	echo -e "${lightcyan}============================================${default}"
+	echo -e " ${white}Windrose Server — Install${default}"
+	echo -e "${lightcyan}============================================${default}"
+	echo ""
+
+	# Setup directory structure
+	mkdir -p "${serverfiles}" "${logdir}/server" "${lgsmlogdir}" \
+		"${configdirserver}" "${backupdir}" "${tmpdir}"
+
+	# Write default configs if not present
+	fn_config_init
+
+	# Load config (may have steamuser/steampass set)
+	fn_load_config
+
+	# Initialize Wine prefix
+	fn_winesetup
+
+	# Download server via SteamCMD
+	fn_steamcmd_install
+
+	echo ""
+	fn_print_ok "Install complete. Edit your config then run './${selfname} start'."
+	fn_print_info "Config: ${configdirserver}/${selfname}.cfg"
+	fn_print_info "Steam credentials (if needed): ${configdirserver}/secrets-${selfname}.cfg"
+}
+
+# --- update ---
+fn_update() {
+	fn_check_user
+	fn_check_deps
+	fn_load_config
+
+	local was_running=false
+	if fn_is_running; then
+		was_running=true
+		fn_print_info "Server is running. Stopping for update..."
+		fn_stop
+	fi
+
+	fn_print_dots "Updating ${selfname}: Checking for update via SteamCMD"
+	fn_steamcmd_update
+
+	if [ "${was_running}" == "true" ]; then
+		fn_print_info "Restarting server after update..."
+		fn_start
+	fi
+}
+
+# --- validate ---
+fn_validate() {
+	fn_check_user
+	fn_check_deps
+	fn_load_config
+
+	fn_print_info "Validating server files via SteamCMD (this may take a while)..."
+	fn_steamcmd_validate
+}
+
+# --- backup ---
+fn_backup() {
+	fn_load_config
+	local ts
+	ts="$(date '+%Y%m%d_%H%M%S')"
+
+	# Per official docs: save data on Windows is in AppData\Local\R5\Saved\SaveProfiles\
+	# Under Wine, this maps to: WINEPREFIX/drive_c/users/<user>/AppData/Local/R5/Saved/
+	local wine_savepath
+	wine_savepath="${wineprefix}/drive_c/users/$(whoami)/AppData/Local/R5/Saved/SaveProfiles"
+
+	local backupfile="${backupdir}/windrose-saves-${ts}.tar.gz"
+
+	mkdir -p "${backupdir}"
+
+	if [ ! -d "${wine_savepath}" ]; then
+		fn_print_warn "No save data found at ${wine_savepath}"
+		fn_print_info "The server must run at least once to generate save data."
+		exit 0
+	fi
+
+	fn_print_dots "Creating backup: ${backupfile}"
+	if tar -czf "${backupfile}" -C "${wineprefix}/drive_c/users/$(whoami)/AppData/Local/R5/Saved" "SaveProfiles"; then
+		fn_print_ok "Backup created: ${backupfile}"
+		fn_script_log_pass "Backup: ${backupfile}"
+	else
+		fn_print_fail "Backup failed."
+		fn_script_log_fail "Backup failed."
+		exit 1
+	fi
+}
+
+# --- configure ---
+fn_configure() {
+	fn_load_config
+	local cfgfile="${configdirserver}/${selfname}.cfg"
+	echo -e "${lightcyan}Opening config: ${cfgfile}${default}"
+	# Use EDITOR env var, fallback to nano then vi
+	"${EDITOR:-${VISUAL:-$(command -v nano || command -v vi)}}" "${cfgfile}"
+}
+
+# ============================================================
+# SteamCMD Functions
+# ============================================================
+
+fn_steamcmd_install_binary() {
+	if [ ! -f "${steamcmddir}/steamcmd.sh" ]; then
+		fn_print_dots "Installing SteamCMD"
+		mkdir -p "${steamcmddir}"
+		local url="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+		if curl -fsSL "${url}" | tar -xzC "${steamcmddir}"; then
+			fn_print_ok "SteamCMD installed."
+			fn_script_log_pass "SteamCMD installed."
+		else
+			fn_print_fail "Failed to download SteamCMD."
+			fn_script_log_fail "SteamCMD download failed."
+			exit 1
+		fi
+	else
+		fn_print_ok "SteamCMD already installed."
+	fi
+}
+
+fn_steamcmd_run() {
+	# $@ = additional steamcmd args
+	# Build login args
+	local login_args
+	if [ -n "${steamuser}" ]; then
+		if [ -n "${steampass}" ]; then
+			login_args="+login ${steamuser} ${steampass}"
+		else
+			login_args="+login ${steamuser}"
+		fi
+	else
+		login_args="+login anonymous"
+	fi
+
+	# Force Windows platform — critical for Windows-only server
+	"${steamcmddir}/steamcmd.sh" \
+		+@sSteamCmdForcePlatformType windows \
+		+force_install_dir "${serverfiles}" \
+		${login_args} \
+		"$@" \
+		+quit
+}
+
+fn_steamcmd_install() {
+	fn_steamcmd_install_binary
+
+	echo ""
+	fn_print_info "Downloading Windrose Dedicated Server (AppID: ${steamappid})"
+	fn_print_info "This is the FREE dedicated server app — anonymous login should work."
+	fn_print_info "NOTE: Using Windows platform override — this is intentional for Linux."
+	echo ""
+
+	# Per official docs, the Dedicated Server app is free to everyone on Steam
+	# so anonymous login should succeed. Only set credentials if it fails.
+	if [ -n "${steamuser}" ]; then
+		fn_print_info "Using Steam account: ${steamuser}"
+	else
+		fn_print_info "Using anonymous login (recommended for this free app)."
+	fi
+
+	fn_steamcmd_run "+app_update ${steamappid} validate"
+	local exitcode=$?
+
+	if [ ${exitcode} -eq 0 ]; then
+		fn_print_ok "Server files downloaded successfully."
+		fn_script_log_pass "SteamCMD install complete."
+	else
+		fn_print_fail "SteamCMD exited with code ${exitcode}."
+		fn_print_info "If you see 'No subscription', the server requires a Steam account that owns the game."
+		fn_print_info "Edit: ${configdirserver}/secrets-${selfname}.cfg"
+		fn_print_info "Set:  steamuser=\"your_steam_username\""
+		fn_print_info "      steampass=\"your_steam_password\""
+		fn_script_log_fail "SteamCMD install failed (exit ${exitcode})."
+		exit 1
+	fi
+}
+
+fn_steamcmd_update() {
+	fn_steamcmd_install_binary
+
+	echo ""
+	fn_print_info "Checking for updates (AppID: ${steamappid})"
+
+	# Get build IDs before update
+	local local_build="unknown"
+	if [ -f "${serverfiles}/steamapps/appmanifest_${steamappid}.acf" ]; then
+		local_build=$(grep '"buildid"' "${serverfiles}/steamapps/appmanifest_${steamappid}.acf" | tr -d '"' | awk '{print $2}')
+	fi
+
+	fn_steamcmd_run "+app_update ${steamappid}"
+	local exitcode=$?
+
+	if [ ${exitcode} -eq 0 ]; then
+		fn_print_ok "Update complete."
+		fn_script_log_pass "SteamCMD update complete."
+	else
+		fn_print_fail "Update failed (exit ${exitcode})."
+		fn_script_log_fail "SteamCMD update failed (exit ${exitcode})."
+		exit 1
+	fi
+}
+
+fn_steamcmd_validate() {
+	fn_steamcmd_install_binary
+	fn_steamcmd_run "+app_update ${steamappid} validate"
+}
+
+# ============================================================
+# Wine Setup
+# ============================================================
+
+fn_winesetup() {
+	fn_print_dots "Initializing Wine prefix (WINEPREFIX=${wineprefix})"
+	fn_script_log_info "Wine prefix init: ${wineprefix}"
+
+	export WINEDEBUG=-all
+	export WINEPREFIX="${wineprefix}"
+
+	# Boot Wine prefix (creates directory structure, sets up registry)
+	WINEDEBUG=-all WINEPREFIX="${wineprefix}" wineboot --init 2>/dev/null
+	sleep 2
+
+	fn_print_ok "Wine prefix initialized."
+	fn_script_log_pass "Wine prefix initialized."
+
+	# Install Visual C++ Runtime (required by UE5 servers)
+	if command -v winetricks &>/dev/null; then
+		fn_print_dots "Installing Visual C++ 2022 runtime via winetricks"
+		WINEPREFIX="${wineprefix}" winetricks -q vcrun2022 2>/dev/null \
+			&& fn_print_ok "vcrun2022 installed." \
+			|| fn_print_warn "winetricks vcrun2022 failed — server may still work."
+	else
+		fn_print_warn "winetricks not found — skipping VC++ runtime install."
+		fn_print_info "If the server crashes, install winetricks and run: WINEPREFIX=${wineprefix} winetricks vcrun2022"
+	fi
+}
+
+# ============================================================
+# Config Initialization
+# ============================================================
+
+fn_config_init() {
+	mkdir -p "${configdirserver}"
+
+	# Write _default.cfg (reference — do not edit)
+	if [ ! -f "${configdirserver}/_default.cfg" ]; then
+		cat > "${configdirserver}/_default.cfg" << 'DEFAULTCFG'
+# windroseserver _default.cfg
+# DO NOT EDIT — default values only. Override in windroseserver.cfg
+# Official guide: https://playwindrose.com/dedicated-server-guide/
+
+## Server Identity
+servername="Windrose Server"
+serverpassword=""
+
+## Network
+# P2pProxyAddress: set to your server's PUBLIC IP for invite code to work over internet
+# Leave as 127.0.0.1 for local/LAN testing
+p2pproxyaddress="127.0.0.1"
+
+## Ports
+port="7777"
+queryport="7778"
+
+## Players
+maxplayers="10"
+
+## Start Parameters (appended to server launch command)
+startparameters="-log -MULTIHOME=0.0.0.0"
+
+## SteamCMD - App is FREE, anonymous login should work
+## Only set credentials if anonymous fails
+steamuser=""
+steampass=""
+
+## Steam App ID (do not change — this is the free Dedicated Server app)
+steamappid="4129620"
+DEFAULTCFG
+	fi
+
+	# Write instance.cfg if not present
+	if [ ! -f "${configdirserver}/${selfname}.cfg" ]; then
+		cat > "${configdirserver}/${selfname}.cfg" << INSTANCECFG
+# windroseserver instance config
+# Your main config. Settings here override _default.cfg.
+# Official guide: https://playwindrose.com/dedicated-server-guide/
+
+## Server Identity
+servername="Windrose Server"
+serverpassword=""
+
+## Network
+# IMPORTANT: Set p2pproxyaddress to your server's PUBLIC IP
+# so that invite codes work for players connecting over the internet.
+# Example: p2pproxyaddress="203.0.113.42"
+p2pproxyaddress="127.0.0.1"
+
+## Ports
+port="7777"
+queryport="7778"
+
+## Players
+maxplayers="10"
+
+## Start Parameters
+startparameters="-log -MULTIHOME=0.0.0.0"
+INSTANCECFG
+		fn_print_ok "Created instance config: ${configdirserver}/${selfname}.cfg"
+	fi
+
+	# Write secrets config (Steam credentials — keep private)
+	if [ ! -f "${configdirserver}/secrets-${selfname}.cfg" ]; then
+		cat > "${configdirserver}/secrets-${selfname}.cfg" << 'SECRETCFG'
+# windroseserver secrets config
+# Store sensitive info here. Not for version control.
+# If Windrose server requires Steam login, set these:
+#
+# steamuser="your_dedicated_server_steam_account"
+# steampass="your_steam_password"
+#
+# Leave blank for anonymous login (try this first).
+steamuser=""
+steampass=""
+SECRETCFG
+		chmod 600 "${configdirserver}/secrets-${selfname}.cfg"
+		fn_print_ok "Created secrets config: ${configdirserver}/secrets-${selfname}.cfg"
+	fi
+}
+
+# ============================================================
+# Command Router (mirrors LinuxGSM command names exactly)
+# ============================================================
+
+fn_print_help() {
+	echo ""
+	echo -e "${lightcyan}Windrose Server Manager v${version}${default}"
+	echo ""
+	echo -e " ${white}Commands${default}"
+	echo -e " ${lightblue}start${default}          st  | Start the server."
+	echo -e " ${lightblue}stop${default}           sp  | Stop the server."
+	echo -e " ${lightblue}restart${default}        r   | Restart the server."
+	echo -e " ${lightblue}monitor${default}        m   | Check server health; restart if down."
+	echo -e " ${lightblue}details${default}        dt  | Show server status and configuration."
+	echo -e " ${lightblue}console${default}        c   | Attach to tmux server console."
+	echo -e " ${lightblue}debug${default}          d   | Start server in foreground (debug)."
+	echo -e " ${lightblue}logs${default}           l   | Tail server logs."
+	echo -e " ${lightblue}install${default}        i   | Download and install the server."
+	echo -e " ${lightblue}auto-install${default}   ai  | Install without prompts."
+	echo -e " ${lightblue}update${default}         u   | Update server files via SteamCMD."
+	echo -e " ${lightblue}validate${default}       v   | Validate server files via SteamCMD."
+	echo -e " ${lightblue}backup${default}         b   | Backup world save data."
+	echo -e " ${lightblue}configure${default}      cfg | Edit instance config in \$EDITOR."
+	echo -e " ${lightblue}winesetup${default}      ws  | (Re)initialize the Wine prefix."
+	echo ""
+}
+
+userinput="${1}"
+case "${userinput}" in
+	start|st)         fn_start ;;
+	stop|sp)          fn_stop ;;
+	restart|r)        fn_restart ;;
+	monitor|m)        fn_monitor ;;
+	details|dt)       fn_details ;;
+	console|c)        fn_console ;;
+	debug|d)          fn_debug ;;
+	logs|l)           fn_logs ;;
+	install|i)        fn_install ;;
+	auto-install|ai)  fn_install ;;
+	update|u)         fn_update ;;
+	validate|v)       fn_validate ;;
+	backup|b)         fn_backup ;;
+	configure|cfg)    fn_configure ;;
+	winesetup|ws)     fn_winesetup ;;
+	*)                fn_print_help ;;
+esac

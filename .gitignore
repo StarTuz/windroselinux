@@ -1,0 +1,14 @@
+# LinuxGSM bootstrap / test files (not part of this project)
+linuxgsm.sh
+smserver
+lgsm/
+
+# Runtime directories (generated on the server)
+serverfiles/
+log/
+backup/
+.wine/
+lgsm/tmp/
+
+# Secrets (never commit)
+lgsm/config-lgsm/*/secrets-*.cfg
