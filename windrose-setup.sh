@@ -78,6 +78,35 @@ fn_check_multilib() {
 }
 
 # ============================================================
+# Kernel Parameter: vm.mmap_min_addr (required by Wine on Slackware)
+# ============================================================
+fn_set_mmap_min_addr() {
+	fn_print_head "Configuring vm.mmap_min_addr (required for Wine)"
+	local current required conf
+	current="$(cat /proc/sys/vm/mmap_min_addr 2>/dev/null || echo 0)"
+	required=65536
+	conf="/etc/sysctl.d/99-windrose-wine.conf"
+
+	# Slackware ships with vm.mmap_min_addr=98304. Wine's preloader needs to
+	# reserve addresses starting at 0x10000 (65536). Without this fix, Wine
+	# prints preloader warnings and the UE5 server may fail to initialize.
+	if [ "${current}" -le "${required}" ] 2>/dev/null; then
+		fn_print_ok "vm.mmap_min_addr=${current} (already ≤ ${required} — no change needed)."
+	else
+		fn_print_info "Current vm.mmap_min_addr=${current}; Wine requires ≤ ${required}."
+		sysctl -w vm.mmap_min_addr="${required}" >/dev/null
+		fn_print_ok "Applied: sysctl vm.mmap_min_addr=${required}"
+	fi
+
+	if [ ! -f "${conf}" ] || ! grep -q "mmap_min_addr" "${conf}" 2>/dev/null; then
+		echo "vm.mmap_min_addr = ${required}" > "${conf}"
+		fn_print_ok "Persisted to ${conf} (survives reboot)."
+	else
+		fn_print_info "Sysctl conf already present: ${conf}"
+	fi
+}
+
+# ============================================================
 # User Creation
 # ============================================================
 fn_create_user() {
@@ -173,25 +202,27 @@ fn_install_winetricks() {
 
 fn_install_xvfb() {
 	fn_print_head "Checking Xvfb (virtual framebuffer)"
-	if command -v Xvfb &>/dev/null; then
-		fn_print_ok "Xvfb is available."
+
+	# Step 1: ensure Xvfb binary is present
+	if ! command -v Xvfb &>/dev/null; then
+		fn_print_warn "Xvfb not found."
+		fn_print_info "Xvfb is required — Unreal Engine 5 servers need a display even headless."
+		echo ""
+		echo "On Slackware, Xvfb is part of xorg-server:"
+		echo "  Check: ls /usr/bin/Xvfb"
+		echo "  If missing, reinstall: installpkg xorg-server-*.t?z"
+		echo ""
+		read -rp "Xvfb not found. Continue setup anyway? [y/N]: " cont
+		[[ "${cont}" =~ ^[Yy]$ ]] || exit 1
 		return 0
 	fi
 
-	fn_print_warn "Xvfb not found."
-	fn_print_info "Xvfb is required — Unreal Engine 5 servers need a display even headless."
-	echo ""
-	echo "On Slackware, Xvfb is part of xorg-server:"
-	echo "  Check: ls /usr/bin/Xvfb"
-	echo "  If missing, reinstall: installpkg xorg-server-*.t?z"
-	echo "  Or upgrade to -current repo which may include xvfb-run"
-	echo ""
-	echo "xvfb-run wrapper (needed by the manager script):"
-	echo "  If xvfb-run is missing but Xvfb is present, we can create a wrapper."
-	echo ""
+	fn_print_ok "Xvfb is available."
 
-	if command -v Xvfb &>/dev/null && ! command -v xvfb-run &>/dev/null; then
-		fn_print_info "Xvfb found but xvfb-run missing. Creating xvfb-run wrapper..."
+	# Step 2: ensure xvfb-run wrapper is present (separate check — Slackware
+	# ships Xvfb but not the xvfb-run convenience wrapper)
+	if ! command -v xvfb-run &>/dev/null; then
+		fn_print_info "xvfb-run wrapper not found. Creating minimal wrapper..."
 		cat > /usr/local/bin/xvfb-run << 'XVFBRUN'
 #!/bin/bash
 # Minimal xvfb-run wrapper for Slackware
@@ -212,9 +243,9 @@ kill $Xvfb_pid 2>/dev/null
 exit $exitcode
 XVFBRUN
 		chmod +x /usr/local/bin/xvfb-run
-		fn_print_ok "xvfb-run wrapper created."
+		fn_print_ok "xvfb-run wrapper created at /usr/local/bin/xvfb-run"
 	else
-		fn_print_warn "Please install xorg-server with Xvfb support."
+		fn_print_ok "xvfb-run is available."
 	fi
 }
 
@@ -424,6 +455,7 @@ main() {
 	fn_check_root
 	fn_check_os
 	fn_check_multilib
+	fn_set_mmap_min_addr
 	fn_check_tmux
 	fn_create_user
 	fn_install_wine

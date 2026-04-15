@@ -717,15 +717,48 @@ fn_winesetup() {
 	fn_print_ok "Wine prefix initialized."
 	fn_script_log_pass "Wine prefix initialized."
 
-	# Install Visual C++ Runtime (required by UE5 servers)
-	if command -v winetricks &>/dev/null; then
-		fn_print_dots "Installing Visual C++ 2022 runtime via winetricks"
-		WINEPREFIX="${wineprefix}" winetricks -q vcrun2022 2>/dev/null \
-			&& fn_print_ok "vcrun2022 installed." \
-			|| fn_print_warn "winetricks vcrun2022 failed — server may still work."
+	# Install x64 Visual C++ 2022 Redistributable (required by WindroseServer-Win64-Shipping.exe)
+	#
+	# winetricks vcrun2022 is NOT used as the primary method: it installs the x86
+	# (32-bit) runtime first and aborts before reaching the x64 installer. The UE5
+	# Win64 shipping binary requires the x64 runtime. Install it directly instead.
+	fn_print_dots "Installing Visual C++ 2022 x64 runtime"
+	local vc_cache="${HOME}/.cache/winetricks/vcrun2022"
+	local vc_installer="${vc_cache}/vc_redist.x64.exe"
+	local vc_url="https://aka.ms/vs/17/release/vc_redist.x64.exe"
+	local vc_ok=false
+
+	mkdir -p "${vc_cache}"
+
+	if curl -L --fail --silent --show-error --output "${vc_installer}" "${vc_url}"; then
+		fn_print_info "Downloaded vc_redist.x64.exe — installing into Wine prefix..."
+		local wine_bin
+		wine_bin="$(fn_wine_cmd)"
+		if WINEPREFIX="${wineprefix}" WINEARCH=win64 \
+				xvfb-run -a "${wine_bin}" "${vc_installer}" /install /quiet /norestart 2>/dev/null; then
+			fn_print_ok "Visual C++ 2022 x64 runtime installed."
+			fn_script_log_pass "vcrun2022 x64 installed via direct installer."
+			vc_ok=true
+		else
+			fn_print_warn "Direct vc_redist.x64.exe installer exited non-zero — trying winetricks fallback."
+			fn_script_log_warn "vc_redist.x64.exe installer failed; falling back to winetricks."
+		fi
 	else
-		fn_print_warn "winetricks not found — skipping VC++ runtime install."
-		fn_print_info "If the server crashes, install winetricks and run: WINEPREFIX=${wineprefix} winetricks vcrun2022"
+		fn_print_warn "Could not download vc_redist.x64.exe from Microsoft — trying winetricks fallback."
+		fn_script_log_warn "curl failed for vc_redist.x64.exe."
+	fi
+
+	if [ "${vc_ok}" = false ]; then
+		if command -v winetricks &>/dev/null; then
+			fn_print_info "Running winetricks vcrun2022 (may only install x86 runtime)..."
+			WINEPREFIX="${wineprefix}" winetricks -q vcrun2022 2>/dev/null \
+				&& fn_print_ok "winetricks vcrun2022 done (x64 runtime may be missing — restart may fail)." \
+				|| fn_print_warn "winetricks vcrun2022 also failed."
+		else
+			fn_print_warn "No VC++ runtime installed. If the server crashes on start, run manually:"
+			fn_print_info "  curl -L -o /tmp/vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe"
+			fn_print_info "  WINEPREFIX=${wineprefix} WINEARCH=win64 xvfb-run -a wine /tmp/vc_redist.x64.exe /install /quiet /norestart"
+		fi
 	fi
 }
 
