@@ -212,25 +212,39 @@ fn_start() {
 		exit 1
 	fi
 
-	mkdir -p "${logdir}/server"
+	mkdir -p "${logdir}/server" "${tmpdir}"
 
 	local wine_bin
 	wine_bin="$(fn_wine_cmd)"
 	local gamelog="${logdir}/server/${selfname}-server.log"
-	local launch_cmd="WINEDEBUG=-all WINEPREFIX=\"${wineprefix}\" xvfb-run -a ${wine_bin} \"${serverfiles}/${serverexe}\" -PORT=${port} -QUERYPORT=${queryport} ${startparameters}"
+
+	# Write a launcher script — avoids fragile quoting when embedding commands in tmux.
+	# This is the same pattern LinuxGSM uses internally.
+	local launcher="${tmpdir}/${selfname}-start.sh"
+	cat > "${launcher}" << LAUNCHER
+#!/bin/bash
+# Auto-generated launcher for ${selfname} — do not edit
+export WINEDEBUG=-all
+export WINEPREFIX="${wineprefix}"
+export WINEARCH=win64
+cd "${serverfiles}"
+exec xvfb-run -a "${wine_bin}" "${serverfiles}/${serverexe}" ${startparameters} >> "${gamelog}" 2>&1
+LAUNCHER
+	chmod +x "${launcher}"
 
 	fn_print_dots "Starting ${selfname}"
-	fn_script_log_info "Starting server: ${launch_cmd}"
+	fn_script_log_info "Starting server via ${launcher}"
 
-	tmux new-session -d -s "${sessionname}" \
-		"bash -c '${launch_cmd} 2>&1 | tee -a \"${gamelog}\"'"
+	tmux new-session -d -s "${sessionname}" "${launcher}"
 
-	sleep 2
+	sleep 3
 	if fn_is_running; then
 		fn_print_ok "Starting ${selfname}"
 		fn_script_log_pass "Server started in tmux session '${sessionname}'."
+		fn_print_info "Invite code: run './windroseserver details' after ~30s startup"
+		fn_print_info "Watch log:   tail -f ${logdir}/server/${selfname}-server.log"
 	else
-		fn_print_fail "Starting ${selfname} — tmux session died immediately. Check logs: ${gamelog}"
+		fn_print_fail "Starting ${selfname} — tmux session died immediately. Check logs."
 		fn_script_log_fail "Server failed to start."
 		exit 1
 	fi
