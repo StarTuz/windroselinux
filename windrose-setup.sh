@@ -280,10 +280,12 @@ fn_check_tmux() {
 # Deploy Manager Script
 # ============================================================
 fn_deploy_script() {
-	fn_print_head "Deploying windroseserver manager script"
+	fn_print_head "Deploying windroseserver manager script and reference files"
 
 	local src="${SCRIPT_SOURCE}/windroseserver"
 	local dst="${INSTALL_DIR}/windroseserver"
+	local setup_src="${SCRIPT_SOURCE}/windrose-setup.sh"
+	local notes_src="${SCRIPT_SOURCE}/WINDROSE-SERVER-NOTES.md"
 
 	if [ ! -f "${src}" ]; then
 		fn_print_fail "windroseserver script not found at: ${src}"
@@ -295,6 +297,23 @@ fn_deploy_script() {
 	chmod +x "${dst}"
 	chown "${WINDROSE_USER}:${WINDROSE_USER}" "${dst}"
 	fn_print_ok "Deployed: ${dst}"
+
+	if [ -f "${setup_src}" ]; then
+		cp "${setup_src}" "${INSTALL_DIR}/windrose-setup.sh"
+		chmod +x "${INSTALL_DIR}/windrose-setup.sh"
+		chown "${WINDROSE_USER}:${WINDROSE_USER}" "${INSTALL_DIR}/windrose-setup.sh"
+		fn_print_ok "Deployed reference: ${INSTALL_DIR}/windrose-setup.sh"
+	else
+		fn_print_warn "Setup script reference not found at: ${setup_src}"
+	fi
+
+	if [ -f "${notes_src}" ]; then
+		cp "${notes_src}" "${INSTALL_DIR}/WINDROSE-SERVER-NOTES.md"
+		chown "${WINDROSE_USER}:${WINDROSE_USER}" "${INSTALL_DIR}/WINDROSE-SERVER-NOTES.md"
+		fn_print_ok "Deployed notes: ${INSTALL_DIR}/WINDROSE-SERVER-NOTES.md"
+	else
+		fn_print_warn "Deployment notes not found at: ${notes_src}"
+	fi
 }
 
 # ============================================================

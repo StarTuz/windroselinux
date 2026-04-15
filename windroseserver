@@ -144,7 +144,7 @@ fn_check_deps() {
 	local missing=()
 	# steamcmd is NOT checked here — fn_steamcmd_install_binary bootstraps it automatically.
 	# wine: modern Wine installs use a single 64-bit 'wine' binary; no separate 'wine64'.
-	for cmd in tmux xvfb-run; do
+	for cmd in tmux xvfb-run python3 curl; do
 		if ! command -v "${cmd}" &>/dev/null; then
 			missing+=("${cmd}")
 		fi
