@@ -2,13 +2,15 @@
 # ============================================================
 # windroseserver — Windrose Dedicated Server Manager
 # Mirrors LinuxGSM interface and conventions.
-# Runs WindroseServer.exe under Wine + Xvfb on Linux.
+# Runs the Windows dedicated server under Wine + Xvfb on Linux.
 #
 # Official guide: https://playwindrose.com/dedicated-server-guide/
 # Steam AppID:    4129620 (FREE dedicated server app - anonymous login)
 #
 # Acquisition: SteamCMD downloads the free Windrose Dedicated Server app.
-# Server EXE:  WindroseServer.exe (Unreal Engine 5, Windows-only)
+# Server EXE:  R5/Binaries/Win64/WindroseServer-Win64-Shipping.exe
+# Note: the root WindroseServer.exe is a prerequisite bootstrapper and blocks
+# headless Wine on a hidden VC++ redistributable prompt.
 # Linux path:  Runs via Wine (wine64) + Xvfb (virtual display)
 #
 # Save data (Wine): WINEPREFIX/drive_c/users/windrose/AppData/Local/R5/
@@ -38,8 +40,9 @@ tmpdir="${lgsmdir}/tmp"
 wineprefix="${rootdir}/.wine"
 
 # Server executable (inside serverfiles)
-# Per official guide: the server app is the WindroseServer folder at root
-serverexe="WindroseServer.exe"
+# The root WindroseServer.exe is a Windows prerequisite bootstrapper that
+# blocks headless Wine on a VC++ install prompt. Launch the UE server directly.
+serverexe="R5/Binaries/Win64/WindroseServer-Win64-Shipping.exe"
 sessionname="${selfname}"
 
 # Wine save data path (AppData is under WINEPREFIX, not serverfiles)
@@ -158,6 +161,22 @@ fn_check_deps() {
 	fi
 }
 
+fn_check_wine_mmap() {
+	local mmap_min_addr
+	mmap_min_addr="$(cat /proc/sys/vm/mmap_min_addr 2>/dev/null || echo 0)"
+
+	if [ "${mmap_min_addr}" -gt 65536 ] 2>/dev/null; then
+		fn_print_fail "Wine low-memory mapping is blocked: vm.mmap_min_addr=${mmap_min_addr}"
+		fn_print_info "Wine is expected to reserve addresses starting at 65536 (0x10000)."
+		fn_print_info "On Slackware, set this as root before starting the server:"
+		fn_print_info "  sysctl -w vm.mmap_min_addr=65536"
+		fn_print_info "To persist it:"
+		fn_print_info "  echo 'vm.mmap_min_addr = 65536' > /etc/sysctl.d/99-windrose-wine.conf"
+		fn_script_log_fail "vm.mmap_min_addr=${mmap_min_addr}; Wine preloader low mapping blocked."
+		exit 1
+	fi
+}
+
 # Resolve the correct wine binary name (wine64 or wine)
 fn_wine_cmd() {
 	if command -v wine64 &>/dev/null; then
@@ -185,8 +204,47 @@ fn_is_running() {
 }
 
 fn_get_pid() {
-	# Get the PID of WindroseServer.exe inside the tmux session
-	pgrep -u "$(whoami)" -f "WindroseServer.exe" | head -1
+	# Get the PID of the Windrose server process inside the tmux session
+	pgrep -u "$(whoami)" -f "WindroseServer-Win64-Shipping.exe|WindroseServer.exe" | head -1
+}
+
+fn_sync_server_description() {
+	local sdesc="${serverfiles}/R5/ServerDescription.json"
+	if [ ! -f "${sdesc}" ]; then
+		return 0
+	fi
+
+	SERVERNAME="${servername}" \
+	SERVERPASSWORD="${serverpassword}" \
+	MAXPLAYERS="${maxplayers}" \
+	P2PPROXYADDRESS="${p2pproxyaddress}" \
+		python3 - "${sdesc}" << 'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+persistent = data.setdefault("ServerDescription_Persistent", {})
+password = os.environ.get("SERVERPASSWORD", "")
+persistent["IsPasswordProtected"] = bool(password)
+persistent["Password"] = password
+persistent["ServerName"] = os.environ.get("SERVERNAME", "")
+persistent["P2pProxyAddress"] = os.environ.get("P2PPROXYADDRESS", "127.0.0.1")
+try:
+    persistent["MaxPlayerCount"] = int(os.environ.get("MAXPLAYERS", "10"))
+except ValueError:
+    persistent["MaxPlayerCount"] = 10
+
+tmp_path = f"{path}.tmp"
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+    f.write("\n")
+os.replace(tmp_path, path)
+PY
+	fn_script_log_info "Synced server settings to ${sdesc}"
 }
 
 # ============================================================
@@ -197,6 +255,7 @@ fn_get_pid() {
 fn_start() {
 	fn_check_user
 	fn_check_deps
+	fn_check_wine_mmap
 	fn_load_config
 
 	if fn_is_running; then
@@ -213,6 +272,7 @@ fn_start() {
 	fi
 
 	mkdir -p "${logdir}/server" "${tmpdir}"
+	fn_sync_server_description
 
 	local wine_bin
 	wine_bin="$(fn_wine_cmd)"
@@ -228,7 +288,7 @@ export WINEDEBUG=-all
 export WINEPREFIX="${wineprefix}"
 export WINEARCH=win64
 cd "${serverfiles}"
-exec xvfb-run -a "${wine_bin}" "${serverfiles}/${serverexe}" ${startparameters} >> "${gamelog}" 2>&1
+exec xvfb-run -a "${wine_bin}" "${serverfiles}/${serverexe}" -PORT="${port}" -QUERYPORT="${queryport}" ${startparameters} >> "${gamelog}" 2>&1
 LAUNCHER
 	chmod +x "${launcher}"
 
@@ -323,6 +383,7 @@ fn_console() {
 fn_debug() {
 	fn_check_user
 	fn_check_deps
+	fn_check_wine_mmap
 	fn_load_config
 
 	if fn_is_running; then
@@ -385,8 +446,11 @@ fn_details() {
 	echo ""
 
 	# Show invite code and server description from ServerDescription.json
-	# The file may be in the root serverfiles dir (after first run)
-	local sdesc="${serverfiles}/ServerDescription.json"
+	# Current builds write it under R5; older docs mention the root folder.
+	local sdesc="${serverfiles}/R5/ServerDescription.json"
+	if [ ! -f "${sdesc}" ] && [ -f "${serverfiles}/ServerDescription.json" ]; then
+		sdesc="${serverfiles}/ServerDescription.json"
+	fi
 	if [ -f "${sdesc}" ]; then
 		echo -e " ${lightblue}ServerDescription.json:${default}"
 		echo ""
@@ -637,6 +701,8 @@ fn_steamcmd_validate() {
 # ============================================================
 
 fn_winesetup() {
+	fn_check_wine_mmap
+
 	fn_print_dots "Initializing Wine prefix (WINEPREFIX=${wineprefix})"
 	fn_script_log_info "Wine prefix init: ${wineprefix}"
 
